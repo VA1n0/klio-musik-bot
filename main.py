@@ -8,22 +8,24 @@ from dotenv import load_dotenv
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from shazamio import Shazam
 import yt_dlp
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Ваш особистий Telegram ID
-ADMIN_ID = 7314990219 
+ADMIN_ID = 7314990219
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 shazam = Shazam()
 
+# Тимчасове сховище для знайдених треків (щоб не перевищувати ліміт даних у callback_data)
+SEARCH_CACHE = {}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- РОБОТА З БАЗОЮ ДАНИХ (SQLite) ---
+# --- DATABASE ---
 def init_db():
     conn = sqlite3.connect("bot_analytics.db")
     cursor = conn.cursor()
@@ -59,7 +61,6 @@ def get_analytics():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
-    
     today = datetime.now().strftime("%Y-%m-%d")
     cursor.execute("SELECT COUNT(*) FROM users WHERE last_active LIKE ?", (f"{today}%",))
     active_today = cursor.fetchone()[0]
@@ -68,7 +69,7 @@ def get_analytics():
 
 init_db()
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- WEB SERVER ---
 async def handle_ping(request):
     return web.Response(text="Bot is live!")
 
@@ -80,101 +81,89 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP-сервер успішно запущено на порту {port}")
 
-# --- ФУНКЦІЇ ОБРОБКИ ТА ЗАВАНТАЖЕННЯ АУДІО ---
-def download_audio_by_query(query: str) -> dict:
+# --- SEARCH & DOWNLOAD FUNCTIONS ---
+def search_tracks(query: str, limit: int = 5) -> list:
+    """Шукає кілька варіантів треків у SoundCloud"""
+    ydl_opts = {
+        'quiet': True,
+        'default_search': f'scsearch{limit}',
+        'extract_flat': True,
+    }
+    results = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            for entry in info['entries']:
+                results.append({
+                    'title': entry.get('title', 'Невідомий трек'),
+                    'url': entry.get('url') or entry.get('webpage_url')
+                })
+    return results
+
+def download_by_url(url: str, output_filename: str) -> str:
+    """Завантажує обраний трек за посиланням"""
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': 'downloaded_song.%(ext)s',
+        'outtmpl': output_filename,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
         'quiet': True,
-        # Використовуємо SoundCloud замість YouTube для обходу анти-бот блокувань Render
-        'default_search': 'scsearch1',
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        if 'entries' in info and len(info['entries']) > 0:
-            info = info['entries'][0]
-        title = info.get("title", "Аудіотрек")
-        return {"title": title, "file": "downloaded_song.mp3"}
+        ydl.download([url])
+    return f"{output_filename}.mp3"
 
 def extract_audio_from_file(input_path: str, output_path: str) -> bool:
-    """Конвертує локальний медіафайл у mp3 через FFmpeg"""
     try:
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', input_path,
-            '-vn',
-            '-acodec', 'libmp3lame',
-            '-q:a', '2',
-            output_path
-        ]
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', output_path]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
-    except Exception as e:
-        logging.error(f"FFmpeg extraction error: {e}")
+    except Exception:
         return False
 
-# --- ХЕНДЛЕРИ КОМАНД ТА АДМІН-ПАНЕЛІ ---
+# --- COMMANDS ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     track_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    await message.answer("Привіт! Надішли мені назву пісні, посилання або відео/кружечок/голосове — я знайду трек.")
+    await message.answer("Привіт! Надішли назву пісні або відео/голосове — я знайду схожі варіанти.")
 
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
     if message.from_user.id == ADMIN_ID:
         total, active_today = get_analytics()
-        stats_text = (
-            "📊 **Статистика бота KLIO:**\n\n"
-            f"👤 Всього унікальних юзерів: **{total}**\n"
-            f"🔥 Активних сьогодні (DAU): **{active_today}**"
-        )
-        await message.answer(stats_text, parse_mode="Markdown")
+        await message.answer(f"📊 **Статистика KLIO:**\n\n👤 Всього: **{total}**\n🔥 Активних: **{active_today}**", parse_mode="Markdown")
 
-@dp.message(Command("export_users"))
-async def export_users(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        conn = sqlite3.connect("bot_analytics.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        rows = cursor.fetchall()
-        conn.close()
+# --- HANDLERS ---
+async def send_search_results(message: types.Message, query: str, status_msg: types.Message):
+    tracks = await asyncio.to_thread(search_tracks, query, 5)
+    if not tracks:
+        await status_msg.edit_text("❌ Нічого не знайдено.")
+        return
 
-        file_path = "users.txt"
-        with open(file_path, "w") as f:
-            for row in rows:
-                f.write(f"{row[0]}\n")
+    user_id = message.from_user.id
+    SEARCH_CACHE[user_id] = tracks
 
-        await message.answer_document(types.FSInputFile(file_path))
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    builder = InlineKeyboardBuilder()
+    for idx, tr in enumerate(tracks):
+        builder.button(text=f"🎵 {tr['title'][:40]}", callback_data=f"dl_{idx}")
+    builder.adjust(1)
 
-# --- ХЕНДЛЕРИ ПОШУКУ ТА МЕДІА ---
+    await status_msg.edit_text(f"🔍 Знайдено варіанти за запитом **{query}**:\nОберіть потрібний трек:", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     track_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    msg = await message.answer("🔎 Шукаю трек...")
-    try:
-        data = await asyncio.to_thread(download_audio_by_query, message.text)
-        audio_file = types.FSInputFile(data["file"])
-        await message.answer_audio(audio=audio_file, caption=f"🎵 {data['title']}")
-        await msg.delete()
-        if os.path.exists(data["file"]):
-            os.remove(data["file"])
-    except Exception as e:
-        logging.error(f"Text error: {e}")
-        await msg.edit_text("❌ Не вдалося знайти або завантажити трек.")
+    msg = await message.answer("🔎 Шукаю варіанти...")
+    await send_search_results(message, message.text, msg)
 
 @dp.message(F.video | F.voice | F.audio | F.video_note)
 async def handle_media(message: types.Message):
     track_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    msg = await message.answer("🎧 Розпізнаю аудіо через Shazam...")
+    msg = await message.answer("🎧 Розпізнаю через Shazam...")
     
     file_id = (message.video.file_id if message.video 
                else message.voice.file_id if message.voice 
@@ -190,50 +179,52 @@ async def handle_media(message: types.Message):
         track = out.get("track")
         
         if not track:
-            # Якщо Shazam не впізнав, пропонуємо витягнути аудіо з самого відео
             extracted_file = "extracted_audio.mp3"
-            success = await asyncio.to_thread(extract_audio_from_file, temp_file, extracted_file)
-            if success and os.path.exists(extracted_file):
-                audio_file = types.FSInputFile(extracted_file)
-                await message.answer_audio(audio=audio_file, caption="🎵 Збережене аудіо з вашого відео")
+            if extract_audio_from_file(temp_file, extracted_file):
+                await message.answer_audio(audio=types.FSInputFile(extracted_file), caption="🎵 Аудіо з вашого відео")
                 await msg.delete()
                 os.remove(extracted_file)
             else:
-                await msg.edit_text("❌ Shazam не зміг розпізнати трек з цього відео.")
+                await msg.edit_text("❌ Не вдалося розпізнати трек.")
             return
 
-        title = track.get("title")
-        subtitle = track.get("subtitle")
-        search_query = f"{subtitle} - {title}"
-        await msg.edit_text(f"✨ Знайдено: **{search_query}**. Завантажую MP3...")
-
-        try:
-            data = await asyncio.to_thread(download_audio_by_query, search_query)
-            audio_file = types.FSInputFile(data["file"])
-            await message.answer_audio(audio=audio_file, caption=f"🎵 {search_query}")
-            await msg.delete()
-            if os.path.exists(data["file"]):
-                os.remove(data["file"])
-        except Exception as search_err:
-            logging.warning(f"SoundCloud search failed, falling back to direct extraction: {search_err}")
-            extracted_file = "extracted_audio.mp3"
-            if extract_audio_from_file(temp_file, extracted_file):
-                audio_file = types.FSInputFile(extracted_file)
-                await message.answer_audio(audio=audio_file, caption=f"🎵 {search_query} (Аудіо з вашого відео)")
-                await msg.delete()
-                if os.path.exists(extracted_file):
-                    os.remove(extracted_file)
-            else:
-                await msg.edit_text("❌ Не вдалося завантажити повноцінний трек.")
+        query = f"{track.get('subtitle')} - {track.get('title')}"
+        await send_search_results(message, query, msg)
 
     except Exception as e:
         logging.error(f"Media error: {e}")
-        await msg.edit_text("❌ Помилка під час обробки медіафайлу.")
+        await msg.edit_text("❌ Помилка під час обробки.")
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-# --- ГОЛОВНИЙ ЗАПУСК ---
+# --- CALLBACK FOR BUTTONS ---
+@dp.callback_query(F.data.startswith("dl_"))
+async def handle_download_callback(callback: types.CallbackQuery):
+    idx = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    tracks = SEARCH_CACHE.get(user_id)
+    if not tracks or idx >= len(tracks):
+        await callback.answer("⏳ Сесія пошуку застаріла. Введіть запит знову.", show_alert=True)
+        return
+
+    selected_track = tracks[idx]
+    await callback.message.edit_text(f"⏳ Завантажую: **{selected_track['title']}**...")
+    
+    out_name = f"song_{user_id}_{idx}"
+    try:
+        file_path = await asyncio.to_thread(download_by_url, selected_track['url'], out_name)
+        audio_file = types.FSInputFile(file_path)
+        await callback.message.answer_audio(audio=audio_file, caption=f"🎵 {selected_track['title']}")
+        await callback.message.delete()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        logging.error(f"Download error: {e}")
+        await callback.message.edit_text("❌ Не вдалося завантажити цей варіант.")
+
+# --- MAIN RUN ---
 async def main():
     asyncio.create_task(start_web_server())
     await dp.start_polling(bot)
