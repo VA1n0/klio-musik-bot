@@ -2,6 +2,7 @@ import os
 import asyncio
 import sqlite3
 import logging
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
@@ -13,7 +14,7 @@ import yt_dlp
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Вкажіть свій особистий Telegram ID (дізнатися можна в @userinfobot)
+# Ваш особистий Telegram ID
 ADMIN_ID = 7314990219 
 
 bot = Bot(token=BOT_TOKEN)
@@ -81,7 +82,7 @@ async def start_web_server():
     await site.start()
     logging.info(f"HTTP-сервер успішно запущено на порту {port}")
 
-# --- ФУНКЦІЯ ЗАВАНТАЖЕННЯ АУДІО ---
+# --- ФУНКЦІЇ ОБРОБКИ ТА ЗАВАНТАЖЕННЯ АУДІО ---
 def download_audio_by_query(query: str) -> dict:
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -92,7 +93,8 @@ def download_audio_by_query(query: str) -> dict:
             'preferredquality': '192',
         }],
         'quiet': True,
-        'default_search': 'ytsearch1',
+        # Використовуємо SoundCloud замість YouTube для обходу анти-бот блокувань Render
+        'default_search': 'scsearch1',
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=True)
@@ -100,6 +102,23 @@ def download_audio_by_query(query: str) -> dict:
             info = info['entries'][0]
         title = info.get("title", "Аудіотрек")
         return {"title": title, "file": "downloaded_song.mp3"}
+
+def extract_audio_from_file(input_path: str, output_path: str) -> bool:
+    """Конвертує локальний медіафайл у mp3 через FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', input_path,
+            '-vn',
+            '-acodec', 'libmp3lame',
+            '-q:a', '2',
+            output_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception as e:
+        logging.error(f"FFmpeg extraction error: {e}")
+        return False
 
 # --- ХЕНДЛЕРИ КОМАНД ТА АДМІН-ПАНЕЛІ ---
 @dp.message(Command("start"))
@@ -169,8 +188,18 @@ async def handle_media(message: types.Message):
     try:
         out = await shazam.recognize(temp_file)
         track = out.get("track")
+        
         if not track:
-            await msg.edit_text("❌ Shazam не зміг розпізнати трек з цього відео.")
+            # Якщо Shazam не впізнав, пропонуємо витягнути аудіо з самого відео
+            extracted_file = "extracted_audio.mp3"
+            success = await asyncio.to_thread(extract_audio_from_file, temp_file, extracted_file)
+            if success and os.path.exists(extracted_file):
+                audio_file = types.FSInputFile(extracted_file)
+                await message.answer_audio(audio=audio_file, caption="🎵 Збережене аудіо з вашого відео")
+                await msg.delete()
+                os.remove(extracted_file)
+            else:
+                await msg.edit_text("❌ Shazam не зміг розпізнати трек з цього відео.")
             return
 
         title = track.get("title")
@@ -178,13 +207,25 @@ async def handle_media(message: types.Message):
         search_query = f"{subtitle} - {title}"
         await msg.edit_text(f"✨ Знайдено: **{search_query}**. Завантажую MP3...")
 
-        data = await asyncio.to_thread(download_audio_by_query, search_query)
-        audio_file = types.FSInputFile(data["file"])
-        await message.answer_audio(audio=audio_file, caption=f"🎵 {search_query}")
-        await msg.delete()
+        try:
+            data = await asyncio.to_thread(download_audio_by_query, search_query)
+            audio_file = types.FSInputFile(data["file"])
+            await message.answer_audio(audio=audio_file, caption=f"🎵 {search_query}")
+            await msg.delete()
+            if os.path.exists(data["file"]):
+                os.remove(data["file"])
+        except Exception as search_err:
+            logging.warning(f"SoundCloud search failed, falling back to direct extraction: {search_err}")
+            extracted_file = "extracted_audio.mp3"
+            if extract_audio_from_file(temp_file, extracted_file):
+                audio_file = types.FSInputFile(extracted_file)
+                await message.answer_audio(audio=audio_file, caption=f"🎵 {search_query} (Аудіо з вашого відео)")
+                await msg.delete()
+                if os.path.exists(extracted_file):
+                    os.remove(extracted_file)
+            else:
+                await msg.edit_text("❌ Не вдалося завантажити повноцінний трек.")
 
-        if os.path.exists(data["file"]):
-            os.remove(data["file"])
     except Exception as e:
         logging.error(f"Media error: {e}")
         await msg.edit_text("❌ Помилка під час обробки медіафайлу.")
