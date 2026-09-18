@@ -20,7 +20,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 shazam = Shazam()
 
-# Тимчасове сховище для знайдених треків (щоб не перевищувати ліміт даних у callback_data)
 SEARCH_CACHE = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -84,28 +83,33 @@ async def start_web_server():
 
 # --- SEARCH & DOWNLOAD FUNCTIONS ---
 def search_tracks(query: str, limit: int = 5) -> list:
-    """Шукає кілька варіантів треків у SoundCloud"""
+    """Шукає варіанти треків через yt_dlp"""
     ydl_opts = {
         'quiet': True,
         'default_search': f'scsearch{limit}',
-        'extract_flat': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
     }
     results = []
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if 'entries' in info:
-            for entry in info['entries']:
-                results.append({
-                    'title': entry.get('title', 'Невідомий трек'),
-                    'url': entry.get('url') or entry.get('webpage_url')
-                })
+        try:
+            info = ydl.extract_info(query, download=False)
+            if info and 'entries' in info:
+                for entry in info['entries']:
+                    if entry:
+                        title = entry.get('title') or entry.get('fulltitle') or "Без назви"
+                        url = entry.get('webpage_url') or entry.get('url')
+                        if url:
+                            results.append({'title': title, 'url': url})
+        except Exception as e:
+            logging.error(f"Search error: {e}")
     return results
 
 def download_by_url(url: str, output_filename: str) -> str:
     """Завантажує обраний трек за посиланням"""
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': output_filename,
+        'outtmpl': f"{output_filename}.%(ext)s",
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -141,7 +145,7 @@ async def admin_panel(message: types.Message):
 async def send_search_results(message: types.Message, query: str, status_msg: types.Message):
     tracks = await asyncio.to_thread(search_tracks, query, 5)
     if not tracks:
-        await status_msg.edit_text("❌ Нічого не знайдено.")
+        await status_msg.edit_text(f"❌ Нічого не знайдено за запитом: **{query}**", parse_mode="Markdown")
         return
 
     user_id = message.from_user.id
@@ -210,7 +214,7 @@ async def handle_download_callback(callback: types.CallbackQuery):
         return
 
     selected_track = tracks[idx]
-    await callback.message.edit_text(f"⏳ Завантажую: **{selected_track['title']}**...")
+    await callback.message.edit_text(f"⏳ Завантажую: **{selected_track['title']}**...", parse_mode="Markdown")
     
     out_name = f"song_{user_id}_{idx}"
     try:
